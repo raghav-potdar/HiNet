@@ -1,0 +1,15 @@
+[project]
+name = "hinet"
+version = "1.0.0"
+description = "HiNet: Deep Image Hiding by Invertible Network (ICCV 2021) — restructured with Nexus-Steg pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "pillow>=10.0",
+    "tqdm>=4.60",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+viz = ["torchviz", "graphviz"]
