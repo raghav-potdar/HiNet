@@ -1,10 +1,17 @@
 #!/usr/bin/env python
-"""HiNet training entry point with Karpathy-style debugging recipe.
+"""HiNet training entry point.
+
+Matches the original HiNet paper parameters exactly:
+    lr = 10^(-4.5), betas = (0.5, 0.999), weight_decay = 1e-5
+    lambda_reconstruction = 5, lambda_guide = 1, lambda_low_frequency = 1
+    batch_size = 16, crop_size = 224, val_crop = 1024
+    scheduler = StepLR(step=1000, gamma=0.5)
+    epochs = 1000, val every 50 epochs, checkpoint every 50 epochs
 
 Usage:
     python main.py --sanity
     python main.py --overfit_one_batch
-    python main.py --epochs 100 --batch_size 16
+    python main.py --epochs 1000 --batch_size 16
 """
 
 import argparse
@@ -49,12 +56,16 @@ class HiNetApp:
         if args.batch_size is None:
             args.batch_size = 16 if self.dm.is_cuda else 4
         print(f"[Config] batch_size={args.batch_size}, epochs={args.epochs}, "
-              f"seed={args.seed}")
+              f"seed={args.seed}, val_freq={args.val_freq}")
 
-        self.pipeline = DataPipeline(crop_size=224, val_crop_size=224)
+        self.pipeline = DataPipeline(
+            crop_size=args.crop_size,
+            val_crop_size=args.val_crop_size,
+        )
         self.train_loader, self.val_loader = self.pipeline.get_loaders(
             args.train_dir, args.val_dir,
             batch_size=args.batch_size,
+            val_batch_size=args.val_batch_size,
             num_workers=self.dm.get_optimal_workers(),
         )
 
@@ -63,14 +74,7 @@ class HiNetApp:
         param_count = sum(p.numel() for p in self.model.parameters())
         print(f"[Model] Parameters: {param_count:,}")
 
-        self.trainer = HiNetTrainer(
-            self.model, self.device, total_epochs=args.epochs,
-        )
-
-        self.scaler = None
-        if self.dm.is_cuda and not args.no_amp:
-            self.scaler = self.dm.get_scaler()
-            print("[AMP] Enabled")
+        self.trainer = HiNetTrainer(self.model, self.device)
 
         os.makedirs("results", exist_ok=True)
         os.makedirs("checkpoints", exist_ok=True)
@@ -105,7 +109,7 @@ class HiNetApp:
             input_img = torch.cat((cover_input, secret_input), 1)
 
             output = self.model(input_img)
-            output_steg = output.narrow(1, 0, 4 * 3)
+            output_steg = output.narrow(1, 0, 12)
             output_z = output.narrow(1, 12, output.shape[1] - 12)
             steg_img = iwt(output_steg)
 
@@ -121,23 +125,16 @@ class HiNetApp:
             l_loss = F.mse_loss(steg_low, cover_low, reduction="sum").item()
             total_loss = g_loss + 5.0 * r_loss + l_loss
 
-        metrics = {
-            "g_loss": g_loss, "r_loss": r_loss,
-            "l_loss": l_loss, "total_loss": total_loss,
-        }
-
-        print(f"\n  g_loss (guide):          {metrics['g_loss']:.4f}")
-        print(f"  r_loss (reconstruction): {metrics['r_loss']:.4f}")
-        print(f"  l_loss (low frequency):  {metrics['l_loss']:.4f}")
-        print(f"  total_loss:              {metrics['total_loss']:.4f}")
+        print(f"\n  g_loss (guide):          {g_loss:.4f}")
+        print(f"  r_loss (reconstruction): {r_loss:.4f}")
+        print(f"  l_loss (low frequency):  {l_loss:.4f}")
+        print(f"  total_loss:              {total_loss:.4f}")
 
         checks_passed = True
-
-        if metrics["g_loss"] > 1000:
+        if g_loss > 1000:
             print("  [WARN] g_loss very high — cover/stego mismatch at init")
             checks_passed = False
-
-        if metrics["r_loss"] < 0.001:
+        if r_loss < 0.001:
             print("  [WARN] r_loss suspiciously low — network may be trivially copying")
             checks_passed = False
 
@@ -145,7 +142,6 @@ class HiNetApp:
             print("\n  [PASS] Initial losses look reasonable")
         else:
             print("\n  [WARN] Some checks flagged — review above")
-
         print("=" * 60)
 
     def run_overfit_one_batch(self):
@@ -164,10 +160,7 @@ class HiNetApp:
         final_loss = None
 
         for step in pbar:
-            metrics = self.trainer.train_step(
-                cover, secret, phase=1, scaler=self.scaler,
-                lambda_reconstruction_override=15.0,
-            )
+            metrics = self.trainer.train_step(cover, secret)
             final_loss = metrics["r_loss"]
             pbar.set_postfix({
                 "total": f"{metrics['total_loss']:.4f}",
@@ -185,7 +178,7 @@ class HiNetApp:
         print("=" * 60)
 
     def run(self):
-        """Full training loop with phased schedule."""
+        """Full training loop matching original HiNet paper."""
         print("\n" + "=" * 60)
         print("TRAINING")
         print("=" * 60)
@@ -194,38 +187,27 @@ class HiNetApp:
         csv_file = open(csv_path, "w", newline="")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
-            "epoch", "phase", "train_loss", "g_loss", "r_loss", "l_loss",
+            "epoch", "train_loss", "g_loss", "r_loss", "l_loss",
             "val_psnr_stego", "val_ssim_stego",
             "val_psnr_secret", "val_ssim_secret", "lr",
         ])
 
         best_psnr_secret = 0.0
-        patience_counter = 0
 
         for epoch in range(self.args.epochs):
-            if epoch < 50:
-                phase = 1
-                lam_rec = 5.0
-            else:
-                phase = 2
-                lam_rec = 7.0
-
             self.model.train()
             epoch_losses = []
 
-            desc = f"Epoch {epoch}/{self.args.epochs} [P{phase}]"
+            desc = f"Epoch {epoch + 1}/{self.args.epochs}"
             pbar = tqdm(self.train_loader, desc=desc, leave=False)
 
             for cover, secret in pbar:
-                metrics = self.trainer.train_step(
-                    cover, secret, phase=phase, scaler=self.scaler,
-                    lambda_reconstruction_override=lam_rec,
-                )
+                metrics = self.trainer.train_step(cover, secret)
                 epoch_losses.append(metrics)
                 pbar.set_postfix({
-                    "loss": f"{metrics['total_loss']:.3f}",
-                    "r": f"{metrics['r_loss']:.3f}",
-                    "g": f"{metrics['g_loss']:.3f}",
+                    "loss": f"{metrics['total_loss']:.1f}",
+                    "r": f"{metrics['r_loss']:.1f}",
+                    "g": f"{metrics['g_loss']:.1f}",
                 })
 
             self.trainer.scheduler.step()
@@ -233,58 +215,59 @@ class HiNetApp:
             avg = {k: np.mean([m[k] for m in epoch_losses])
                    for k in epoch_losses[0]}
 
-            val_metrics, sample = self.trainer.validate(self.val_loader)
-
             lr = self.trainer.optimizer.param_groups[0]["lr"]
+
+            val_metrics = None
+            sample = None
+            if (epoch + 1) % self.args.val_freq == 0:
+                val_metrics, sample = self.trainer.validate(self.val_loader)
+
+                print(f"  Epoch {epoch + 1:4d} | loss={avg['total_loss']:.1f} | "
+                      f"PSNR(stego)={val_metrics['psnr_stego']:.2f}dB | "
+                      f"PSNR(secret)={val_metrics['psnr_secret']:.2f}dB | "
+                      f"SSIM(s)={val_metrics['ssim_secret']:.4f}")
+
+                if val_metrics["psnr_secret"] > best_psnr_secret:
+                    best_psnr_secret = val_metrics["psnr_secret"]
+                    torch.save({
+                        "epoch": epoch,
+                        "net": self.model.state_dict(),
+                        "opt": self.trainer.optimizer.state_dict(),
+                        "psnr_secret": best_psnr_secret,
+                    }, "checkpoints/hinet_best.pth")
+                    print(f"    -> Best PSNR(secret)={best_psnr_secret:.2f}dB saved")
+
+                if sample is not None:
+                    cover_s, secret_s, steg_s, rev_s = sample
+                    save_image_grid(
+                        [cover_s, secret_s, steg_s, rev_s],
+                        f"results/epoch_{epoch + 1}.png", nrow=4,
+                    )
+            else:
+                print(f"  Epoch {epoch + 1:4d} | loss={avg['total_loss']:.1f} | "
+                      f"g={avg['g_loss']:.1f} r={avg['r_loss']:.1f} l={avg['l_loss']:.1f} | "
+                      f"lr={lr:.2e}")
+
             csv_writer.writerow([
-                epoch, phase,
+                epoch + 1,
                 f"{avg['total_loss']:.6f}",
                 f"{avg['g_loss']:.6f}",
                 f"{avg['r_loss']:.6f}",
                 f"{avg['l_loss']:.6f}",
-                f"{val_metrics['psnr_stego']:.2f}",
-                f"{val_metrics['ssim_stego']:.4f}",
-                f"{val_metrics['psnr_secret']:.2f}",
-                f"{val_metrics['ssim_secret']:.4f}",
+                f"{val_metrics['psnr_stego']:.2f}" if val_metrics else "",
+                f"{val_metrics['ssim_stego']:.4f}" if val_metrics else "",
+                f"{val_metrics['psnr_secret']:.2f}" if val_metrics else "",
+                f"{val_metrics['ssim_secret']:.4f}" if val_metrics else "",
                 f"{lr:.2e}",
             ])
             csv_file.flush()
-
-            print(f"  Epoch {epoch:3d} | P{phase} | loss={avg['total_loss']:.4f} | "
-                  f"PSNR(stego)={val_metrics['psnr_stego']:.1f}dB | "
-                  f"PSNR(secret)={val_metrics['psnr_secret']:.1f}dB | "
-                  f"SSIM(s)={val_metrics['ssim_secret']:.3f}")
-
-            if sample is not None:
-                cover_s, secret_s, steg_s, rev_s = sample
-                save_image_grid(
-                    [cover_s, secret_s, steg_s, rev_s],
-                    f"results/epoch_{epoch}.png", nrow=4,
-                )
-
-            if val_metrics["psnr_secret"] > best_psnr_secret + 0.1:
-                best_psnr_secret = val_metrics["psnr_secret"]
-                patience_counter = 0
-                torch.save({
-                    "epoch": epoch,
-                    "net": self.model.state_dict(),
-                    "opt": self.trainer.optimizer.state_dict(),
-                    "psnr_secret": best_psnr_secret,
-                }, "checkpoints/hinet_best.pth")
-                print(f"    -> Best PSNR(secret)={best_psnr_secret:.2f}dB saved")
-            else:
-                patience_counter += 1
 
             if (epoch + 1) % self.args.checkpoint_every == 0:
                 torch.save({
                     "epoch": epoch,
                     "net": self.model.state_dict(),
                     "opt": self.trainer.optimizer.state_dict(),
-                }, f"checkpoints/hinet_epoch_{epoch}.pth")
-
-            if epoch >= self.args.min_epochs and patience_counter >= self.args.patience:
-                print(f"\n  [Early Stop] No improvement for {self.args.patience} epochs")
-                break
+                }, f"checkpoints/hinet_epoch_{epoch + 1}.pth")
 
         csv_file.close()
 
@@ -300,19 +283,18 @@ class HiNetApp:
 
 def main():
     parser = argparse.ArgumentParser(description="HiNet Training")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--val_batch_size", type=int, default=2)
+    parser.add_argument("--crop_size", type=int, default=224)
+    parser.add_argument("--val_crop_size", type=int, default=1024)
+    parser.add_argument("--val_freq", type=int, default=50)
+    parser.add_argument("--checkpoint_every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--patience", type=int, default=15)
-    parser.add_argument("--min_epochs", type=int, default=30,
-                        help="Minimum epochs before early stopping kicks in")
-    parser.add_argument("--checkpoint_every", type=int, default=10)
     parser.add_argument("--train_dir", type=str,
                         default="datasets/DIV2K_train_HR")
     parser.add_argument("--val_dir", type=str,
                         default="datasets/DIV2K_valid_HR")
-    parser.add_argument("--no_amp", action="store_true",
-                        help="Disable automatic mixed precision")
     parser.add_argument("--sanity", action="store_true",
                         help="Run sanity checks only")
     parser.add_argument("--overfit_one_batch", action="store_true",

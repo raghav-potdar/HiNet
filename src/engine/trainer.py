@@ -6,11 +6,10 @@ import torch.nn.functional as F
 import numpy as np
 
 from src.models.dwt import DWT, IWT
-from src.models.noise_layer import DifferentiableNoiseLayer
 
 
 def compute_psnr(x, y):
-    """PSNR for tensors in [0, 1] range."""
+    """PSNR for tensors in [0, 1] range (equivalent to 255-scale formula)."""
     mse = F.mse_loss(x, y)
     if mse < 1e-10:
         return torch.tensor(100.0)
@@ -18,8 +17,6 @@ def compute_psnr(x, y):
 
 
 class SSIMCalculator:
-    """Structural Similarity Index calculator."""
-
     def __init__(self, window_size=11, channels=3):
         self.window_size = window_size
         self.channels = channels
@@ -59,7 +56,19 @@ class SSIMCalculator:
 
 
 class HiNetTrainer:
-    def __init__(self, model, device, total_epochs=100,
+    """Trainer matching the original HiNet paper exactly.
+
+    Original paper parameters:
+        lr = 10^(-4.5) = 3.16e-5
+        betas = (0.5, 0.999)
+        weight_decay = 1e-5
+        lambda_reconstruction = 5, lambda_guide = 1, lambda_low_frequency = 1
+        scheduler = StepLR(step_size=1000, gamma=0.5)
+        loss = MSE with reduction='sum'
+        no noise layer, no AMP, no grad clipping
+    """
+
+    def __init__(self, model, device,
                  lr=3.16e-5, betas=(0.5, 0.999), weight_decay=1e-5,
                  lambda_guide=1.0, lambda_reconstruction=5.0,
                  lambda_low_frequency=1.0):
@@ -67,13 +76,11 @@ class HiNetTrainer:
         self.device = device
         self.dwt = DWT()
         self.iwt = IWT()
-        self.noise_layer = DifferentiableNoiseLayer().to(device)
         self.ssim_calc = SSIMCalculator()
 
         self.lambda_guide = lambda_guide
         self.lambda_reconstruction = lambda_reconstruction
         self.lambda_low_frequency = lambda_low_frequency
-
         self.channels_in = 3
 
         params = list(filter(lambda p: p.requires_grad, model.parameters()))
@@ -87,80 +94,44 @@ class HiNetTrainer:
     def _gauss_noise(self, shape):
         return torch.randn(shape, device=self.device)
 
-    def _guide_loss(self, output, target):
-        return F.mse_loss(output, target, reduction="sum")
-
-    def _reconstruction_loss(self, output, target):
-        return F.mse_loss(output, target, reduction="sum")
-
-    def _low_frequency_loss(self, steg_low, cover_low):
-        return F.mse_loss(steg_low, cover_low, reduction="sum")
-
-    def train_step(self, cover, secret, phase=1, scaler=None,
-                   lambda_reconstruction_override=None):
-        """One training step.
-
-        Phase 1: no noise
-        Phase 2+: noise layer active on stego before reverse pass
-        """
+    def train_step(self, cover, secret):
         self.model.train()
-        self.noise_layer.train()
         cover = cover.to(self.device)
         secret = secret.to(self.device)
 
-        lam_rec = lambda_reconstruction_override or self.lambda_reconstruction
+        cover_input = self.dwt(cover)
+        secret_input = self.dwt(secret)
+        input_img = torch.cat((cover_input, secret_input), 1)
 
-        use_amp = scaler is not None
-        amp_ctx = torch.amp.autocast("cuda") if use_amp else _nullcontext()
+        output = self.model(input_img)
+        output_steg = output.narrow(1, 0, 4 * self.channels_in)
+        output_z = output.narrow(1, 4 * self.channels_in,
+                                 output.shape[1] - 4 * self.channels_in)
+        steg_img = self.iwt(output_steg)
 
-        with amp_ctx:
-            cover_input = self.dwt(cover)
-            secret_input = self.dwt(secret)
-            input_img = torch.cat((cover_input, secret_input), 1)
+        output_z_gauss = self._gauss_noise(output_z.shape)
+        output_rev = torch.cat((output_steg, output_z_gauss), 1)
+        output_image = self.model(output_rev, rev=True)
 
-            output = self.model(input_img)
-            output_steg = output.narrow(1, 0, 4 * self.channels_in)
-            output_z = output.narrow(1, 4 * self.channels_in,
-                                     output.shape[1] - 4 * self.channels_in)
-            steg_img = self.iwt(output_steg)
+        secret_rev_wav = output_image.narrow(
+            1, 4 * self.channels_in,
+            output_image.shape[1] - 4 * self.channels_in,
+        )
+        secret_rev = self.iwt(secret_rev_wav)
 
-            if phase >= 2:
-                steg_noised = self.noise_layer(steg_img)
-                steg_noised_wav = self.dwt(steg_noised)
-            else:
-                steg_noised_wav = output_steg
+        g_loss = F.mse_loss(steg_img, cover, reduction="sum")
+        r_loss = F.mse_loss(secret_rev, secret, reduction="sum")
+        steg_low = output_steg.narrow(1, 0, self.channels_in)
+        cover_low = cover_input.narrow(1, 0, self.channels_in)
+        l_loss = F.mse_loss(steg_low, cover_low, reduction="sum")
 
-            output_z_gauss = self._gauss_noise(output_z.shape)
-            output_rev = torch.cat((steg_noised_wav, output_z_gauss), 1)
-            output_image = self.model(output_rev, rev=True)
+        total_loss = (self.lambda_guide * g_loss +
+                      self.lambda_reconstruction * r_loss +
+                      self.lambda_low_frequency * l_loss)
 
-            secret_rev_wav = output_image.narrow(
-                1, 4 * self.channels_in,
-                output_image.shape[1] - 4 * self.channels_in,
-            )
-            secret_rev = self.iwt(secret_rev_wav)
-
-            g_loss = self._guide_loss(steg_img, cover)
-            r_loss = self._reconstruction_loss(secret_rev, secret)
-            steg_low = output_steg.narrow(1, 0, self.channels_in)
-            cover_low = cover_input.narrow(1, 0, self.channels_in)
-            l_loss = self._low_frequency_loss(steg_low, cover_low)
-
-            total_loss = (self.lambda_guide * g_loss +
-                          lam_rec * r_loss +
-                          self.lambda_low_frequency * l_loss)
-
+        total_loss.backward()
+        self.optimizer.step()
         self.optimizer.zero_grad()
-        if use_amp:
-            scaler.scale(total_loss).backward()
-            scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            scaler.step(self.optimizer)
-            scaler.update()
-        else:
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
 
         return {
             "total_loss": total_loss.item(),
@@ -171,7 +142,6 @@ class HiNetTrainer:
 
     @torch.no_grad()
     def validate(self, val_loader):
-        """Run validation, return average metrics and first-batch visual sample."""
         self.model.eval()
         psnr_stego_list = []
         psnr_secret_list = []
@@ -226,11 +196,3 @@ class HiNetTrainer:
             "ssim_stego": np.mean(ssim_stego_list) if ssim_stego_list else 0.0,
             "ssim_secret": np.mean(ssim_secret_list) if ssim_secret_list else 0.0,
         }, sample
-
-
-class _nullcontext:
-    """Minimal no-op context manager for non-AMP paths."""
-    def __enter__(self):
-        return self
-    def __exit__(self, *args):
-        pass

@@ -63,10 +63,13 @@ class DataPipeline:
             T.ToTensor(),
         ])
 
-    def get_loaders(self, train_dir, val_dir, batch_size, num_workers=4):
+    def get_loaders(self, train_dir, val_dir, batch_size,
+                    val_batch_size=2, num_workers=4):
         if batch_size % 2 != 0:
             batch_size += 1
             print(f"[Data] Adjusted batch_size to {batch_size} (must be even)")
+        if val_batch_size % 2 != 0:
+            val_batch_size += 1
 
         train_ds = DIV2KDataset(train_dir, transform=self.train_transform)
         val_ds = DIV2KDataset(val_dir, transform=self.val_transform)
@@ -82,14 +85,15 @@ class DataPipeline:
         )
         val_loader = DataLoader(
             val_ds,
-            batch_size=max(2, batch_size // 4),
+            batch_size=val_batch_size,
             shuffle=False,
             num_workers=max(1, num_workers // 2),
             pin_memory=True,
             drop_last=True,
             collate_fn=split_batch_collate,
         )
-        print(f"[Data] Train: {len(train_ds)} images, Val: {len(val_ds)} images")
+        print(f"[Data] Train: {len(train_ds)} images (crop={self.train_transform.transforms[0].size}), "
+              f"Val: {len(val_ds)} images (crop={self.val_transform.transforms[0].size})")
         return train_loader, val_loader
 
     def get_val_loader(self, val_dir, batch_size=4, num_workers=2):

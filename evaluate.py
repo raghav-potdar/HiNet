@@ -154,6 +154,7 @@ def main():
     parser.add_argument("--val_dir", type=str,
                         default="datasets/DIV2K_valid_HR")
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--val_crop_size", type=int, default=1024)
     args = parser.parse_args()
 
     dm = DeviceManager()
@@ -165,7 +166,7 @@ def main():
     model.eval()
     print(f"[Eval] Loaded checkpoint: {args.checkpoint}")
 
-    pipeline = DataPipeline(crop_size=224, val_crop_size=224)
+    pipeline = DataPipeline(crop_size=224, val_crop_size=args.val_crop_size)
     val_loader = pipeline.get_val_loader(args.val_dir, batch_size=args.batch_size)
 
     evaluator = Evaluator(model, device)
