@@ -1,17 +1,23 @@
 #!/usr/bin/env python
-"""HiNet training entry point.
+"""HiNet training entry point — supports multi-stage training.
 
-Matches the original HiNet paper parameters exactly:
-    lr = 10^(-4.5), betas = (0.5, 0.999), weight_decay = 1e-5
+Default parameters (original HiNet paper):
+    lr = 10^(-4.5) = 3.16e-5, betas = (0.5, 0.999), weight_decay = 1e-5
     lambda_reconstruction = 5, lambda_guide = 1, lambda_low_frequency = 1
     batch_size = 16, crop_size = 224, val_crop = 1024
     scheduler = StepLR(step=1000, gamma=0.5)
-    epochs = 1000, val every 50 epochs, checkpoint every 50 epochs
 
-Usage:
-    python main.py --sanity
-    python main.py --overfit_one_batch
-    python main.py --epochs 1000 --batch_size 16
+Multi-stage workflow (from HiNet README training demo):
+    # Stage 1: lr = 10^(-4.5), train 500 epochs
+    python main.py --epochs 500 --lr 3.16e-5
+
+    # Stage 2: resume, lr = 10^(-5.0)
+    python main.py --epochs 1190 --lr 1e-5 \
+        --resume checkpoints/hinet_epoch_500.pth --start_epoch 500
+
+    # Stage 3: resume, lr = 10^(-5.2)
+    python main.py --epochs 500 --lr 6.31e-6 \
+        --resume checkpoints/hinet_epoch_1690.pth --start_epoch 1690
 """
 
 import argparse
@@ -56,7 +62,9 @@ class HiNetApp:
         if args.batch_size is None:
             args.batch_size = 16 if self.dm.is_cuda else 4
         print(f"[Config] batch_size={args.batch_size}, epochs={args.epochs}, "
-              f"seed={args.seed}, val_freq={args.val_freq}")
+              f"lr={args.lr:.2e}, seed={args.seed}, val_freq={args.val_freq}")
+        if args.resume:
+            print(f"[Config] Resuming from {args.resume}, start_epoch={args.start_epoch}")
 
         self.pipeline = DataPipeline(
             crop_size=args.crop_size,
@@ -74,7 +82,16 @@ class HiNetApp:
         param_count = sum(p.numel() for p in self.model.parameters())
         print(f"[Model] Parameters: {param_count:,}")
 
-        self.trainer = HiNetTrainer(self.model, self.device)
+        self.trainer = HiNetTrainer(self.model, self.device, lr=args.lr)
+
+        if args.resume:
+            ckpt = torch.load(args.resume, map_location=self.device)
+            self.model.load_state_dict(ckpt["net"])
+            self.trainer.optimizer.load_state_dict(ckpt["opt"])
+            for pg in self.trainer.optimizer.param_groups:
+                pg["lr"] = args.lr
+            print(f"[Resume] Loaded checkpoint (epoch {ckpt.get('epoch', '?')}), "
+                  f"LR set to {args.lr:.2e}")
 
         os.makedirs("results", exist_ok=True)
         os.makedirs("checkpoints", exist_ok=True)
@@ -178,27 +195,35 @@ class HiNetApp:
         print("=" * 60)
 
     def run(self):
-        """Full training loop matching original HiNet paper."""
+        """Full training loop with multi-stage resume support."""
+        start = self.args.start_epoch
+        end = start + self.args.epochs
+
         print("\n" + "=" * 60)
-        print("TRAINING")
+        print(f"TRAINING  (epochs {start + 1} -> {end})")
         print("=" * 60)
 
         csv_path = "results/training_log.csv"
-        csv_file = open(csv_path, "w", newline="")
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow([
-            "epoch", "train_loss", "g_loss", "r_loss", "l_loss",
-            "val_psnr_stego", "val_ssim_stego",
-            "val_psnr_secret", "val_ssim_secret", "lr",
-        ])
+        if self.args.resume and os.path.exists(csv_path):
+            csv_file = open(csv_path, "a", newline="")
+            csv_writer = csv.writer(csv_file)
+        else:
+            csv_file = open(csv_path, "w", newline="")
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow([
+                "epoch", "train_loss", "g_loss", "r_loss", "l_loss",
+                "val_psnr_stego", "val_ssim_stego",
+                "val_psnr_secret", "val_ssim_secret", "lr",
+            ])
 
         best_psnr_secret = 0.0
 
-        for epoch in range(self.args.epochs):
+        for epoch in range(start, end):
+            global_ep = epoch + 1
             self.model.train()
             epoch_losses = []
 
-            desc = f"Epoch {epoch + 1}/{self.args.epochs}"
+            desc = f"Epoch {global_ep}/{end}"
             pbar = tqdm(self.train_loader, desc=desc, leave=False)
 
             for cover, secret in pbar:
@@ -219,10 +244,10 @@ class HiNetApp:
 
             val_metrics = None
             sample = None
-            if (epoch + 1) % self.args.val_freq == 0:
+            if global_ep % self.args.val_freq == 0:
                 val_metrics, sample = self.trainer.validate(self.val_loader)
 
-                print(f"  Epoch {epoch + 1:4d} | loss={avg['total_loss']:.1f} | "
+                print(f"  Epoch {global_ep:4d} | loss={avg['total_loss']:.1f} | "
                       f"PSNR(stego)={val_metrics['psnr_stego']:.2f}dB | "
                       f"PSNR(secret)={val_metrics['psnr_secret']:.2f}dB | "
                       f"SSIM(s)={val_metrics['ssim_secret']:.4f}")
@@ -241,15 +266,15 @@ class HiNetApp:
                     cover_s, secret_s, steg_s, rev_s = sample
                     save_image_grid(
                         [cover_s, secret_s, steg_s, rev_s],
-                        f"results/epoch_{epoch + 1}.png", nrow=4,
+                        f"results/epoch_{global_ep}.png", nrow=4,
                     )
             else:
-                print(f"  Epoch {epoch + 1:4d} | loss={avg['total_loss']:.1f} | "
+                print(f"  Epoch {global_ep:4d} | loss={avg['total_loss']:.1f} | "
                       f"g={avg['g_loss']:.1f} r={avg['r_loss']:.1f} l={avg['l_loss']:.1f} | "
                       f"lr={lr:.2e}")
 
             csv_writer.writerow([
-                epoch + 1,
+                global_ep,
                 f"{avg['total_loss']:.6f}",
                 f"{avg['g_loss']:.6f}",
                 f"{avg['r_loss']:.6f}",
@@ -262,12 +287,12 @@ class HiNetApp:
             ])
             csv_file.flush()
 
-            if (epoch + 1) % self.args.checkpoint_every == 0:
+            if global_ep % self.args.checkpoint_every == 0:
                 torch.save({
                     "epoch": epoch,
                     "net": self.model.state_dict(),
                     "opt": self.trainer.optimizer.state_dict(),
-                }, f"checkpoints/hinet_epoch_{epoch + 1}.pth")
+                }, f"checkpoints/hinet_epoch_{global_ep}.pth")
 
         csv_file.close()
 
@@ -276,7 +301,8 @@ class HiNetApp:
             "net": self.model.state_dict(),
             "opt": self.trainer.optimizer.state_dict(),
         }, "checkpoints/hinet_final.pth")
-        print(f"\n  Training complete. Best PSNR(secret)={best_psnr_secret:.2f}dB")
+        print(f"\n  Training complete (epochs {start + 1}-{end}). "
+              f"Best PSNR(secret)={best_psnr_secret:.2f}dB")
         print(f"  Logs: {csv_path}")
         print("=" * 60)
 
@@ -284,6 +310,12 @@ class HiNetApp:
 def main():
     parser = argparse.ArgumentParser(description="HiNet Training")
     parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--lr", type=float, default=3.16e-5,
+                        help="Learning rate (default: 10^-4.5 = 3.16e-5)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint .pth to resume from")
+    parser.add_argument("--start_epoch", type=int, default=0,
+                        help="Global epoch offset when resuming (e.g. 500)")
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--val_batch_size", type=int, default=2)
     parser.add_argument("--crop_size", type=int, default=224)
