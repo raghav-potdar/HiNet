@@ -130,6 +130,13 @@ class HiNetTrainer:
                       self.lambda_low_frequency * l_loss)
 
         total_loss.backward()
+
+        grad_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                grad_norm += p.grad.detach().norm(2).item() ** 2
+        grad_norm = grad_norm ** 0.5
+
         self.optimizer.step()
         self.optimizer.zero_grad()
 
@@ -138,6 +145,7 @@ class HiNetTrainer:
             "g_loss": g_loss.item(),
             "r_loss": r_loss.item(),
             "l_loss": l_loss.item(),
+            "grad_norm": grad_norm,
         }
 
     @torch.no_grad()

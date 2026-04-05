@@ -212,6 +212,7 @@ class HiNetApp:
             csv_writer = csv.writer(csv_file)
             csv_writer.writerow([
                 "epoch", "train_loss", "g_loss", "r_loss", "l_loss",
+                "grad_norm",
                 "val_psnr_stego", "val_ssim_stego",
                 "val_psnr_secret", "val_ssim_secret", "lr",
             ])
@@ -233,6 +234,7 @@ class HiNetApp:
                     "loss": f"{metrics['total_loss']:.1f}",
                     "r": f"{metrics['r_loss']:.1f}",
                     "g": f"{metrics['g_loss']:.1f}",
+                    "gnorm": f"{metrics['grad_norm']:.2f}",
                 })
 
             self.trainer.scheduler.step()
@@ -248,6 +250,7 @@ class HiNetApp:
                 val_metrics, sample = self.trainer.validate(self.val_loader)
 
                 print(f"  Epoch {global_ep:4d} | loss={avg['total_loss']:.1f} | "
+                      f"gnorm={avg['grad_norm']:.2f} | "
                       f"PSNR(stego)={val_metrics['psnr_stego']:.2f}dB | "
                       f"PSNR(secret)={val_metrics['psnr_secret']:.2f}dB | "
                       f"SSIM(s)={val_metrics['ssim_secret']:.4f}")
@@ -271,7 +274,7 @@ class HiNetApp:
             else:
                 print(f"  Epoch {global_ep:4d} | loss={avg['total_loss']:.1f} | "
                       f"g={avg['g_loss']:.1f} r={avg['r_loss']:.1f} l={avg['l_loss']:.1f} | "
-                      f"lr={lr:.2e}")
+                      f"gnorm={avg['grad_norm']:.2f} | lr={lr:.2e}")
 
             csv_writer.writerow([
                 global_ep,
@@ -279,6 +282,7 @@ class HiNetApp:
                 f"{avg['g_loss']:.6f}",
                 f"{avg['r_loss']:.6f}",
                 f"{avg['l_loss']:.6f}",
+                f"{avg['grad_norm']:.4f}",
                 f"{val_metrics['psnr_stego']:.2f}" if val_metrics else "",
                 f"{val_metrics['ssim_stego']:.4f}" if val_metrics else "",
                 f"{val_metrics['psnr_secret']:.2f}" if val_metrics else "",
@@ -321,7 +325,7 @@ def main():
     parser.add_argument("--crop_size", type=int, default=224)
     parser.add_argument("--val_crop_size", type=int, default=1024)
     parser.add_argument("--val_freq", type=int, default=50)
-    parser.add_argument("--checkpoint_every", type=int, default=50)
+    parser.add_argument("--checkpoint_every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train_dir", type=str,
                         default="datasets/DIV2K_train_HR")
