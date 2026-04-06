@@ -56,7 +56,7 @@ class SSIMCalculator:
 
 
 class HiNetTrainer:
-    """Trainer matching the original HiNet paper exactly.
+    """HiNet trainer with optional gradient safety.
 
     Original paper parameters:
         lr = 10^(-4.5) = 3.16e-5
@@ -65,18 +65,22 @@ class HiNetTrainer:
         lambda_reconstruction = 5, lambda_guide = 1, lambda_low_frequency = 1
         scheduler = StepLR(step_size=1000, gamma=0.5)
         loss = MSE with reduction='sum'
-        no noise layer, no AMP, no grad clipping
+
+    Gradient safety (enabled by default, disable with max_grad_norm=None):
+        Per-step gradient clipping prevents catastrophic single-batch spikes.
     """
 
     def __init__(self, model, device,
                  lr=3.16e-5, betas=(0.5, 0.999), weight_decay=1e-5,
                  lambda_guide=1.0, lambda_reconstruction=5.0,
-                 lambda_low_frequency=1.0):
+                 lambda_low_frequency=1.0,
+                 max_grad_norm=10.0):
         self.model = model
         self.device = device
         self.dwt = DWT()
         self.iwt = IWT()
         self.ssim_calc = SSIMCalculator()
+        self.max_grad_norm = max_grad_norm
 
         self.lambda_guide = lambda_guide
         self.lambda_reconstruction = lambda_reconstruction
@@ -131,11 +135,14 @@ class HiNetTrainer:
 
         total_loss.backward()
 
-        grad_norm = 0.0
-        for p in self.model.parameters():
-            if p.grad is not None:
-                grad_norm += p.grad.detach().norm(2).item() ** 2
-        grad_norm = grad_norm ** 0.5
+        raw_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), max_norm=float("inf"),
+        ).item()
+
+        if self.max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=self.max_grad_norm,
+            )
 
         self.optimizer.step()
         self.optimizer.zero_grad()
@@ -145,7 +152,9 @@ class HiNetTrainer:
             "g_loss": g_loss.item(),
             "r_loss": r_loss.item(),
             "l_loss": l_loss.item(),
-            "grad_norm": grad_norm,
+            "raw_grad_norm": raw_grad_norm,
+            "grad_norm": min(raw_grad_norm, self.max_grad_norm)
+                         if self.max_grad_norm is not None else raw_grad_norm,
         }
 
     @torch.no_grad()

@@ -62,7 +62,8 @@ class HiNetApp:
         if args.batch_size is None:
             args.batch_size = 16 if self.dm.is_cuda else 4
         print(f"[Config] batch_size={args.batch_size}, epochs={args.epochs}, "
-              f"lr={args.lr:.2e}, seed={args.seed}, val_freq={args.val_freq}")
+              f"lr={args.lr:.2e}, seed={args.seed}, val_freq={args.val_freq}, "
+              f"start_epoch={args.start_epoch}")
         if args.resume:
             print(f"[Config] Resuming from {args.resume}, start_epoch={args.start_epoch}")
 
@@ -82,7 +83,13 @@ class HiNetApp:
         param_count = sum(p.numel() for p in self.model.parameters())
         print(f"[Model] Parameters: {param_count:,}")
 
-        self.trainer = HiNetTrainer(self.model, self.device, lr=args.lr)
+        mgn = None if args.no_grad_safety else args.max_grad_norm
+        self.trainer = HiNetTrainer(self.model, self.device, lr=args.lr,
+                                    max_grad_norm=mgn)
+        if mgn is not None:
+            print(f"[GradSafety] clip={mgn}, watchdog_factor={args.grad_watch_factor}")
+        else:
+            print("[GradSafety] Disabled (--no_grad_safety)")
 
         if args.resume:
             ckpt = torch.load(args.resume, map_location=self.device)
@@ -195,9 +202,10 @@ class HiNetApp:
         print("=" * 60)
 
     def run(self):
-        """Full training loop with multi-stage resume support."""
+        """Full training loop with multi-stage resume and gradient safety."""
         start = self.args.start_epoch
         end = start + self.args.epochs
+        use_watchdog = not self.args.no_grad_safety
 
         print("\n" + "=" * 60)
         print(f"TRAINING  (epochs {start + 1} -> {end})")
@@ -212,12 +220,14 @@ class HiNetApp:
             csv_writer = csv.writer(csv_file)
             csv_writer.writerow([
                 "epoch", "train_loss", "g_loss", "r_loss", "l_loss",
-                "grad_norm",
+                "raw_grad_norm", "grad_norm",
                 "val_psnr_stego", "val_ssim_stego",
                 "val_psnr_secret", "val_ssim_secret", "lr",
             ])
 
         best_psnr_secret = 0.0
+        gnorm_ema = None
+        ema_alpha = 0.1
 
         for epoch in range(start, end):
             global_ep = epoch + 1
@@ -234,7 +244,7 @@ class HiNetApp:
                     "loss": f"{metrics['total_loss']:.1f}",
                     "r": f"{metrics['r_loss']:.1f}",
                     "g": f"{metrics['g_loss']:.1f}",
-                    "gnorm": f"{metrics['grad_norm']:.2f}",
+                    "gnorm": f"{metrics['raw_grad_norm']:.0f}",
                 })
 
             self.trainer.scheduler.step()
@@ -243,6 +253,31 @@ class HiNetApp:
                    for k in epoch_losses[0]}
 
             lr = self.trainer.optimizer.param_groups[0]["lr"]
+            raw_gn = avg["raw_grad_norm"]
+
+            # --- Gradient norm watchdog ---
+            if use_watchdog:
+                if gnorm_ema is None:
+                    gnorm_ema = raw_gn
+                else:
+                    threshold = self.args.grad_watch_factor * gnorm_ema
+                    if raw_gn > threshold and global_ep > start + 5:
+                        emer_path = f"checkpoints/hinet_emergency_epoch_{global_ep}.pth"
+                        torch.save({
+                            "epoch": epoch,
+                            "net": self.model.state_dict(),
+                            "opt": self.trainer.optimizer.state_dict(),
+                        }, emer_path)
+                        old_lr = lr
+                        for pg in self.trainer.optimizer.param_groups:
+                            pg["lr"] = pg["lr"] * 0.5
+                        lr = self.trainer.optimizer.param_groups[0]["lr"]
+                        print(f"  [WATCHDOG] Epoch {global_ep}: raw_grad_norm "
+                              f"{raw_gn:.0f} > {threshold:.0f} "
+                              f"({self.args.grad_watch_factor}x EMA) | "
+                              f"LR {old_lr:.2e} -> {lr:.2e} | "
+                              f"Saved {emer_path}")
+                    gnorm_ema = ema_alpha * raw_gn + (1 - ema_alpha) * gnorm_ema
 
             val_metrics = None
             sample = None
@@ -250,7 +285,7 @@ class HiNetApp:
                 val_metrics, sample = self.trainer.validate(self.val_loader)
 
                 print(f"  Epoch {global_ep:4d} | loss={avg['total_loss']:.1f} | "
-                      f"gnorm={avg['grad_norm']:.2f} | "
+                      f"gnorm={raw_gn:.0f} | "
                       f"PSNR(stego)={val_metrics['psnr_stego']:.2f}dB | "
                       f"PSNR(secret)={val_metrics['psnr_secret']:.2f}dB | "
                       f"SSIM(s)={val_metrics['ssim_secret']:.4f}")
@@ -274,7 +309,7 @@ class HiNetApp:
             else:
                 print(f"  Epoch {global_ep:4d} | loss={avg['total_loss']:.1f} | "
                       f"g={avg['g_loss']:.1f} r={avg['r_loss']:.1f} l={avg['l_loss']:.1f} | "
-                      f"gnorm={avg['grad_norm']:.2f} | lr={lr:.2e}")
+                      f"gnorm={raw_gn:.0f} | lr={lr:.2e}")
 
             csv_writer.writerow([
                 global_ep,
@@ -282,6 +317,7 @@ class HiNetApp:
                 f"{avg['g_loss']:.6f}",
                 f"{avg['r_loss']:.6f}",
                 f"{avg['l_loss']:.6f}",
+                f"{avg['raw_grad_norm']:.4f}",
                 f"{avg['grad_norm']:.4f}",
                 f"{val_metrics['psnr_stego']:.2f}" if val_metrics else "",
                 f"{val_metrics['ssim_stego']:.4f}" if val_metrics else "",
@@ -324,13 +360,19 @@ def main():
     parser.add_argument("--val_batch_size", type=int, default=2)
     parser.add_argument("--crop_size", type=int, default=224)
     parser.add_argument("--val_crop_size", type=int, default=1024)
-    parser.add_argument("--val_freq", type=int, default=50)
+    parser.add_argument("--val_freq", type=int, default=10)
     parser.add_argument("--checkpoint_every", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train_dir", type=str,
                         default="datasets/DIV2K_train_HR")
     parser.add_argument("--val_dir", type=str,
                         default="datasets/DIV2K_valid_HR")
+    parser.add_argument("--max_grad_norm", type=float, default=10.0,
+                        help="Per-step gradient clipping threshold (default: 10.0)")
+    parser.add_argument("--grad_watch_factor", type=float, default=5.0,
+                        help="Epoch watchdog triggers at factor * EMA baseline (default: 5.0)")
+    parser.add_argument("--no_grad_safety", action="store_true",
+                        help="Disable gradient clipping and watchdog (exact paper reproduction)")
     parser.add_argument("--sanity", action="store_true",
                         help="Run sanity checks only")
     parser.add_argument("--overfit_one_batch", action="store_true",
