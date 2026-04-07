@@ -83,9 +83,18 @@ class HiNetApp:
         param_count = sum(p.numel() for p in self.model.parameters())
         print(f"[Model] Parameters: {param_count:,}")
 
+        noise_layer = None
+        if args.noise:
+            from src.models.noise_layer import DifferentiableNoiseLayer
+            noise_layer = DifferentiableNoiseLayer(
+                jpeg_quality_range=(args.jpeg_quality_min, args.jpeg_quality_max),
+            ).to(self.device)
+            print(f"[Noise] Enabled (JPEG quality {args.jpeg_quality_min}-{args.jpeg_quality_max})")
+
         mgn = None if args.no_grad_safety else args.max_grad_norm
         self.trainer = HiNetTrainer(self.model, self.device, lr=args.lr,
-                                    max_grad_norm=mgn)
+                                    max_grad_norm=mgn,
+                                    noise_layer=noise_layer)
         if mgn is not None:
             print(f"[GradSafety] clip={mgn}, watchdog_factor={args.grad_watch_factor}")
         else:
@@ -373,6 +382,12 @@ def main():
                         help="Epoch watchdog triggers at factor * EMA baseline (default: 5.0)")
     parser.add_argument("--no_grad_safety", action="store_true",
                         help="Disable gradient clipping and watchdog (exact paper reproduction)")
+    parser.add_argument("--noise", action="store_true",
+                        help="Enable differentiable noise layer during training")
+    parser.add_argument("--jpeg_quality_min", type=float, default=50,
+                        help="Lower bound of JPEG quality range (default: 50)")
+    parser.add_argument("--jpeg_quality_max", type=float, default=95,
+                        help="Upper bound of JPEG quality range (default: 95)")
     parser.add_argument("--sanity", action="store_true",
                         help="Run sanity checks only")
     parser.add_argument("--overfit_one_batch", action="store_true",

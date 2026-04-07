@@ -74,13 +74,15 @@ class HiNetTrainer:
                  lr=3.16e-5, betas=(0.5, 0.999), weight_decay=1e-5,
                  lambda_guide=1.0, lambda_reconstruction=5.0,
                  lambda_low_frequency=1.0,
-                 max_grad_norm=10.0):
+                 max_grad_norm=10.0,
+                 noise_layer=None):
         self.model = model
         self.device = device
         self.dwt = DWT()
         self.iwt = IWT()
         self.ssim_calc = SSIMCalculator()
         self.max_grad_norm = max_grad_norm
+        self.noise_layer = noise_layer
 
         self.lambda_guide = lambda_guide
         self.lambda_reconstruction = lambda_reconstruction
@@ -113,8 +115,14 @@ class HiNetTrainer:
                                  output.shape[1] - 4 * self.channels_in)
         steg_img = self.iwt(output_steg)
 
+        if self.noise_layer is not None:
+            steg_noised = self.noise_layer(steg_img)
+            output_steg_noised = self.dwt(steg_noised)
+        else:
+            output_steg_noised = output_steg
+
         output_z_gauss = self._gauss_noise(output_z.shape)
-        output_rev = torch.cat((output_steg, output_z_gauss), 1)
+        output_rev = torch.cat((output_steg_noised, output_z_gauss), 1)
         output_image = self.model(output_rev, rev=True)
 
         secret_rev_wav = output_image.narrow(

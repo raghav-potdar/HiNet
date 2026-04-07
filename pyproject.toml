@@ -9,7 +9,9 @@ dependencies = [
     "pillow>=10.0",
     "tqdm>=4.60",
     "numpy>=1.24",
+    "diff-jpeg @ git+https://github.com/necla-ml/Diff-JPEG",
+    "kornia>=0.6.11",
+    "scipy>=1.0.0",
 ]
-
 [project.optional-dependencies]
 viz = ["torchviz", "graphviz"]
