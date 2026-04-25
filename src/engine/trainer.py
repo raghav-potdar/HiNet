@@ -221,3 +221,201 @@ class HiNetTrainer:
             "ssim_stego": np.mean(ssim_stego_list) if ssim_stego_list else 0.0,
             "ssim_secret": np.mean(ssim_secret_list) if ssim_secret_list else 0.0,
         }, sample
+
+
+class DecoupledTrainer:
+    """Trainer for HiNetDecoupled (invertible hide + CBAM-UNet reveal).
+
+    Two independent Adam optimizers so the hide net can be fine-tuned at a
+    low LR while the reveal net trains from scratch at a higher LR. The
+    reveal path operates on the (possibly noised) pixel-domain stego image
+    directly, bypassing HiNet's reverse pass.
+    """
+
+    def __init__(self, model, device,
+                 hide_lr=1e-6, reveal_lr=1e-4,
+                 betas=(0.5, 0.999), weight_decay=1e-5,
+                 lambda_guide=1.0, lambda_reconstruction=5.0,
+                 lambda_low_frequency=1.0,
+                 max_grad_norm=10.0,
+                 noise_layer=None,
+                 freeze_hide_epochs=0,
+                 step_size=1000, gamma=0.5):
+        self.model = model
+        self.device = device
+        self.dwt = DWT()
+        self.iwt = IWT()
+        self.ssim_calc = SSIMCalculator()
+        self.max_grad_norm = max_grad_norm
+        self.noise_layer = noise_layer
+        self.freeze_hide_epochs = freeze_hide_epochs
+        self.current_epoch = 0
+        self.hide_frozen = False
+
+        self.lambda_guide = lambda_guide
+        self.lambda_reconstruction = lambda_reconstruction
+        self.lambda_low_frequency = lambda_low_frequency
+        self.channels_in = 3
+
+        hide_params = list(filter(lambda p: p.requires_grad,
+                                  self.model.hide.parameters()))
+        reveal_params = list(filter(lambda p: p.requires_grad,
+                                    self.model.reveal.parameters()))
+
+        self.opt_hide = torch.optim.Adam(
+            hide_params, lr=hide_lr, betas=betas, eps=1e-6,
+            weight_decay=weight_decay,
+        )
+        self.opt_reveal = torch.optim.Adam(
+            reveal_params, lr=reveal_lr, betas=betas, eps=1e-6,
+            weight_decay=weight_decay,
+        )
+
+        self.sched_hide = torch.optim.lr_scheduler.StepLR(
+            self.opt_hide, step_size=step_size, gamma=gamma,
+        )
+        self.sched_reveal = torch.optim.lr_scheduler.StepLR(
+            self.opt_reveal, step_size=step_size, gamma=gamma,
+        )
+
+        if freeze_hide_epochs > 0:
+            self._freeze_hide(True)
+
+        # Compatibility shims so outer code that inspects .optimizer /
+        # .scheduler still works (watchdog logic in main.py).
+        self.optimizer = self.opt_reveal
+        self.scheduler = self.sched_reveal
+
+    def _freeze_hide(self, freeze):
+        for p in self.model.hide.parameters():
+            p.requires_grad = not freeze
+        self.hide_frozen = freeze
+
+    def set_epoch(self, epoch):
+        """Called at the start of each training epoch. Unfreezes the hide
+        net once freeze_hide_epochs have elapsed."""
+        self.current_epoch = epoch
+        if self.hide_frozen and epoch >= self.freeze_hide_epochs:
+            self._freeze_hide(False)
+            print(f"[DecoupledTrainer] Unfreezing hide at epoch {epoch}")
+
+    def train_step(self, cover, secret):
+        self.model.train()
+        cover = cover.to(self.device)
+        secret = secret.to(self.device)
+
+        cover_input = self.dwt(cover)
+        secret_input = self.dwt(secret)
+        input_img = torch.cat((cover_input, secret_input), 1)
+
+        output = self.model.hide_forward(input_img)
+        output_steg = output.narrow(1, 0, 4 * self.channels_in)
+        steg_img = self.iwt(output_steg)
+
+        if self.noise_layer is not None:
+            steg_noised = self.noise_layer(steg_img)
+        else:
+            steg_noised = steg_img
+
+        steg_noised_clamped = steg_noised.clamp(0.0, 1.0)
+        secret_rev = self.model.reveal_forward(steg_noised_clamped)
+
+        g_loss = F.mse_loss(steg_img, cover, reduction="sum")
+        r_loss = F.mse_loss(secret_rev, secret, reduction="sum")
+        steg_low = output_steg.narrow(1, 0, self.channels_in)
+        cover_low = cover_input.narrow(1, 0, self.channels_in)
+        l_loss = F.mse_loss(steg_low, cover_low, reduction="sum")
+
+        total_loss = (self.lambda_guide * g_loss +
+                      self.lambda_reconstruction * r_loss +
+                      self.lambda_low_frequency * l_loss)
+
+        self.opt_hide.zero_grad()
+        self.opt_reveal.zero_grad()
+        total_loss.backward()
+
+        raw_grad_norm_reveal = torch.nn.utils.clip_grad_norm_(
+            self.model.reveal.parameters(), max_norm=float("inf"),
+        ).item()
+        if not self.hide_frozen:
+            raw_grad_norm_hide = torch.nn.utils.clip_grad_norm_(
+                self.model.hide.parameters(), max_norm=float("inf"),
+            ).item()
+        else:
+            raw_grad_norm_hide = 0.0
+
+        if self.max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.reveal.parameters(), max_norm=self.max_grad_norm,
+            )
+            if not self.hide_frozen:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.hide.parameters(), max_norm=self.max_grad_norm,
+                )
+
+        if not self.hide_frozen:
+            self.opt_hide.step()
+        self.opt_reveal.step()
+
+        raw_grad_norm = max(raw_grad_norm_hide, raw_grad_norm_reveal)
+        grad_norm = (min(raw_grad_norm, self.max_grad_norm)
+                     if self.max_grad_norm is not None else raw_grad_norm)
+
+        return {
+            "total_loss": total_loss.item(),
+            "g_loss": g_loss.item(),
+            "r_loss": r_loss.item(),
+            "l_loss": l_loss.item(),
+            "raw_grad_norm": raw_grad_norm,
+            "grad_norm": grad_norm,
+            "raw_grad_norm_hide": raw_grad_norm_hide,
+            "raw_grad_norm_reveal": raw_grad_norm_reveal,
+        }
+
+    @torch.no_grad()
+    def validate(self, val_loader):
+        self.model.eval()
+        psnr_stego_list = []
+        psnr_secret_list = []
+        ssim_stego_list = []
+        ssim_secret_list = []
+        sample = None
+
+        for cover, secret in val_loader:
+            cover = cover.to(self.device)
+            secret = secret.to(self.device)
+
+            cover_input = self.dwt(cover)
+            secret_input = self.dwt(secret)
+            input_img = torch.cat((cover_input, secret_input), 1)
+
+            output = self.model.hide_forward(input_img)
+            output_steg = output.narrow(1, 0, 4 * self.channels_in)
+            steg_img = self.iwt(output_steg)
+            steg_clamped = steg_img.clamp(0, 1)
+
+            secret_rev = self.model.reveal_forward(steg_clamped)
+
+            cover_clamped = cover.clamp(0, 1)
+            secret_clamped = secret.clamp(0, 1)
+            rev_clamped = secret_rev.clamp(0, 1)
+
+            psnr_stego_list.append(compute_psnr(steg_clamped, cover_clamped).item())
+            psnr_secret_list.append(compute_psnr(rev_clamped, secret_clamped).item())
+            ssim_stego_list.append(self.ssim_calc(steg_clamped, cover_clamped).item())
+            ssim_secret_list.append(self.ssim_calc(rev_clamped, secret_clamped).item())
+
+            if sample is None:
+                sample = (
+                    cover_clamped[0].cpu(),
+                    secret_clamped[0].cpu(),
+                    steg_clamped[0].cpu(),
+                    rev_clamped[0].cpu(),
+                )
+
+        return {
+            "psnr_stego": np.mean(psnr_stego_list) if psnr_stego_list else 0.0,
+            "psnr_secret": np.mean(psnr_secret_list) if psnr_secret_list else 0.0,
+            "ssim_stego": np.mean(ssim_stego_list) if ssim_stego_list else 0.0,
+            "ssim_secret": np.mean(ssim_secret_list) if ssim_secret_list else 0.0,
+        }, sample

@@ -22,16 +22,18 @@ from src.data.pipeline import DataPipeline
 from src.engine.trainer import compute_psnr, SSIMCalculator
 from src.models.dwt import DWT, IWT
 from src.models.hinet import HiNetModel
+from src.models.hinet_decoupled import HiNetDecoupled
 
 
 class Evaluator:
-    def __init__(self, model, device):
+    def __init__(self, model, device, decoupled=False):
         self.model = model
         self.device = device
         self.dwt = DWT()
         self.iwt = IWT()
         self.ssim_calc = SSIMCalculator()
         self.channels_in = 3
+        self.decoupled = decoupled
 
     def _gauss_noise(self, shape):
         return torch.randn(shape, device=self.device)
@@ -45,20 +47,26 @@ class Evaluator:
         secret_input = self.dwt(secret)
         input_img = torch.cat((cover_input, secret_input), 1)
 
-        output = self.model(input_img)
-        output_steg = output.narrow(1, 0, 4 * self.channels_in)
-        output_z = output.narrow(1, 4 * self.channels_in,
-                                 output.shape[1] - 4 * self.channels_in)
-        steg_img = self.iwt(output_steg)
+        if self.decoupled:
+            output = self.model.hide_forward(input_img)
+            output_steg = output.narrow(1, 0, 4 * self.channels_in)
+            steg_img = self.iwt(output_steg)
+            secret_rev = self.model.reveal_forward(steg_img.clamp(0, 1))
+        else:
+            output = self.model(input_img)
+            output_steg = output.narrow(1, 0, 4 * self.channels_in)
+            output_z = output.narrow(1, 4 * self.channels_in,
+                                     output.shape[1] - 4 * self.channels_in)
+            steg_img = self.iwt(output_steg)
 
-        output_z_gauss = self._gauss_noise(output_z.shape)
-        output_rev = torch.cat((output_steg, output_z_gauss), 1)
-        output_image = self.model(output_rev, rev=True)
-        secret_rev_wav = output_image.narrow(
-            1, 4 * self.channels_in,
-            output_image.shape[1] - 4 * self.channels_in,
-        )
-        secret_rev = self.iwt(secret_rev_wav)
+            output_z_gauss = self._gauss_noise(output_z.shape)
+            output_rev = torch.cat((output_steg, output_z_gauss), 1)
+            output_image = self.model(output_rev, rev=True)
+            secret_rev_wav = output_image.narrow(
+                1, 4 * self.channels_in,
+                output_image.shape[1] - 4 * self.channels_in,
+            )
+            secret_rev = self.iwt(secret_rev_wav)
 
         return steg_img.clamp(0, 1), secret_rev.clamp(0, 1)
 
@@ -66,6 +74,10 @@ class Evaluator:
     def reveal_from_stego(self, stego):
         """Reveal secret from a (potentially attacked) stego image."""
         stego = stego.to(self.device)
+
+        if self.decoupled:
+            return self.model.reveal_forward(stego.clamp(0, 1)).clamp(0, 1)
+
         steg_wav = self.dwt(stego)
         z_shape = (stego.shape[0], 4 * self.channels_in,
                    stego.shape[2] // 2, stego.shape[3] // 2)
@@ -160,16 +172,24 @@ def main():
     dm = DeviceManager()
     device = dm.device
 
-    model = HiNetModel().to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["net"])
+    decoupled = "reveal" in ckpt and "hide" in ckpt
+
+    if decoupled:
+        model = HiNetDecoupled().to(device)
+        model.hide.load_state_dict(ckpt["hide"])
+        model.reveal.load_state_dict(ckpt["reveal"])
+        print(f"[Eval] Loaded decoupled checkpoint: {args.checkpoint}")
+    else:
+        model = HiNetModel().to(device)
+        model.load_state_dict(ckpt["net"])
+        print(f"[Eval] Loaded checkpoint: {args.checkpoint}")
     model.eval()
-    print(f"[Eval] Loaded checkpoint: {args.checkpoint}")
 
     pipeline = DataPipeline(crop_size=224, val_crop_size=args.val_crop_size)
     val_loader = pipeline.get_val_loader(args.val_dir, batch_size=args.batch_size)
 
-    evaluator = Evaluator(model, device)
+    evaluator = Evaluator(model, device, decoupled=decoupled)
 
     os.makedirs("results/evaluation", exist_ok=True)
 
