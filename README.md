@@ -26,7 +26,10 @@ script. The unmodified reference implementation is preserved under
 │   ├── engine/             # trainer (loss, optimizer, validation, SSIM/PSNR)
 │   └── models/             # HiNet, invertible block, dense block, DWT/IWT, noise layer
 ├── scripts/
-│   └── download_div2k.sh   # dataset download helper
+│   ├── download_div2k.sh   # DIV2K dataset download helper
+│   ├── BatchHiNet-*.sh     # SLURM batch jobs for the UB-HPC cluster (CSE676)
+│   └── HiNet_Colab.ipynb   # Google Colab variant of the walkthrough notebook
+├── HiNet.ipynb             # local end-to-end walkthrough notebook
 ├── legacy/                 # original ICCV-2021 reference code (kept for reference)
 ├── datasets/               # DIV2K_train_HR/ and DIV2K_valid_HR/ (gitignored)
 ├── checkpoints/            # hinet_best.pth, hinet_epoch_*.pth, emergency saves (gitignored)
@@ -132,6 +135,70 @@ This evaluates the model under the following attacks (defined in
 - `social` — combined resize 0.75 + JPEG 70 (social-media-like pipeline)
 
 Each attack is graded `PASS` (>28 dB), `WARN` (>20 dB), or `FAIL`.
+
+## Results
+
+These numbers come from `results/evaluation/report.txt` for a model trained
+with the Stage 1 schedule (1000 epochs, clean, `lr=3.16e-5`,
+`val_crop_size=1024`) and evaluated on the DIV2K validation set:
+
+| Attack      | PSNR (dB) | SSIM    | Grade |
+| ----------- | --------- | ------- | ----- |
+| `clean`     | 30.42     | 0.9207  | PASS  |
+| `jpeg_90`   | 24.16     | 0.7039  | WARN  |
+| `jpeg_50`   | 21.24     | 0.5692  | WARN  |
+| `blur`      | 19.56     | 0.6414  | FAIL  |
+| `noise`     | 26.10     | 0.7464  | WARN  |
+| `resize_50` | 19.90     | 0.6778  | FAIL  |
+| `resize_75` | 21.16     | 0.7438  | WARN  |
+| `social`    | 19.52     | 0.5959  | FAIL  |
+
+The clean baseline reaches paper-comparable quality, while the unprotected
+Stage 1 model degrades under non-trivial channel attacks — which is exactly
+the motivation for the Stage 2 noise-aware fine-tuning step. Stage 1 final
+training metrics (epoch 1000, from `results/training_log.csv`):
+PSNR(stego) = 25.20 dB, SSIM(stego) = 0.7192, PSNR(secret) = 32.08 dB,
+SSIM(secret) = 0.9310.
+
+Each evaluation strip below shows, left to right:
+**cover · secret · stego · attacked stego · revealed secret**.
+
+Clean (no attack — best case):
+
+![Clean evaluation strip](docs/images/eval_clean.jpg)
+
+`social` attack (resize 0.75 + JPEG 70 — worst case from the suite):
+
+![Social attack evaluation strip](docs/images/eval_social.jpg)
+
+The full-resolution strips for every attack are written to
+`results/evaluation/<attack>.png` when you run `evaluate.py`.
+
+## Scripts
+
+The [`scripts/`](scripts/) folder contains a dataset helper plus the SLURM batch
+jobs used to run training on the UB-HPC `ub-hpc` cluster (CSE676 account). Each
+batch script stages the project into `/scratch/<username>/`, unzips DIV2K, loads
+the cluster's `pytorch` / `torchvision` / `pillow` / `jax` / `tqdm` modules,
+runs `main.py` with a specific configuration, and finally copies `results/`
+and `checkpoints/` back to the project share.
+
+- `download_div2k.sh` — downloads and extracts DIV2K train + valid HR sets into
+  `datasets/` (idempotent: skips if the folders already exist).
+- `BatchHiNet-Full-Training-2000.sh` — Stage 1 reference: 2000 epochs of clean
+  training at `lr=3.16e-5`.
+- `BatchHiNet-Noise-50-95-LR-1e-5-FromScratch.sh` — noise-aware training from
+  scratch, 1000 epochs at `lr=1e-5`, JPEG quality 50–95.
+- `BatchHiNet-Noise-50-95-LR-2e-6-Resume2000.sh` — Stage 2 reference: noise
+  fine-tuning resumed from `model/hinet_trained_till_2000.pth` at `lr=2e-6`,
+  JPEG quality 50–95.
+- `BatchHiNet-Noise-Decopuled-70-95-LR-1e-6-1e-4-200.sh` — decoupled-reveal
+  experiment (`--decoupled_reveal`): hide branch frozen for 10 epochs at
+  `lr=1e-6`, reveal branch at `reveal_lr=1e-4`, JPEG 70–95, 200 epochs.
+
+If you don't run on UB-HPC, treat the batch scripts as documented examples of
+the full `main.py` invocations rather than ready-to-run jobs — the `#SBATCH`
+header, `module load` lines, and paths are cluster-specific.
 
 ## Legacy reference code
 
