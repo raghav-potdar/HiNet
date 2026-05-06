@@ -1,112 +1,147 @@
 # HiNet: Deep Image Hiding by Invertible Network
-This repo is the official code for
 
-* [**HiNet: Deep Image Hiding by Invertible Network.**](https://openaccess.thecvf.com/content/ICCV2021/html/Jing_HiNet_Deep_Image_Hiding_by_Invertible_Network_ICCV_2021_paper.html) 
-  * [*Junpeng Jing*](https://tomtomtommi.github.io/), [*Xin Deng*](http://www.commsp.ee.ic.ac.uk/~xindeng/), [*Mai Xu*](http://shi.buaa.edu.cn/MaiXu/zh_CN/index.htm), [*Jianyi Wang*](http://buaamc2.net/html/Members/jianyiwang.html), [*Zhenyu Guan*](http://cst.buaa.edu.cn/info/1071/2542.htm).
+This repository contains a refactored implementation of
+[**HiNet: Deep Image Hiding by Invertible Network**](https://openaccess.thecvf.com/content/ICCV2021/html/Jing_HiNet_Deep_Image_Hiding_by_Invertible_Network_ICCV_2021_paper.html)
+(Junpeng Jing, Xin Deng, Mai Xu, Jianyi Wang, Zhenyu Guan — ICCV 2021,
+[MC2 Lab](http://buaamc2.net/) @ Beihang University).
 
-Published on [**ICCV 2021**](http://iccv2021.thecvf.com/home).
-By [MC2 Lab](http://buaamc2.net/) @ [Beihang University](http://ev.buaa.edu.cn/).
+The original paper code has been restructured into a modular `src/` package with
+a multi-stage training driver and a post-training attack-robustness evaluation
+script. The unmodified reference implementation is preserved under
+[`legacy/`](legacy/) for comparison.
 
 <center>
-  <img src=https://github.com/TomTomTommi/HiNet/blob/main/HiNet.png width=60% />
+  <img src="HiNet.png" width="60%" />
 </center>
- 
-## Dependencies and Installation
-- Python 3 (Recommend to use [Anaconda](https://www.anaconda.com/download/#linux)).
-- [PyTorch = 1.0.1](https://pytorch.org/) .
-- See [environment.yml](https://github.com/TomTomTommi/HiNet/blob/main/environment.yml) for other dependencies.
 
+## Project layout
 
-## Get Started
-- Run `python train.py` for training.
+```
+.
+├── main.py                 # training entry point (multi-stage, noise layer, gradient safety)
+├── evaluate.py             # post-training evaluation with attack robustness suite
+├── src/
+│   ├── core/               # device manager
+│   ├── data/               # DIV2K data pipeline
+│   ├── engine/             # trainer (loss, optimizer, validation, SSIM/PSNR)
+│   └── models/             # HiNet, invertible block, dense block, DWT/IWT, noise layer
+├── scripts/
+│   └── download_div2k.sh   # dataset download helper
+├── legacy/                 # original ICCV-2021 reference code (kept for reference)
+├── datasets/               # DIV2K_train_HR/ and DIV2K_valid_HR/ (gitignored)
+├── checkpoints/            # hinet_best.pth, hinet_epoch_*.pth, emergency saves (gitignored)
+├── results/                # epoch sample grids, training_log.csv, evaluation/ (gitignored)
+├── pyproject.toml          # project metadata and dependencies
+└── environment.yml         # optional Conda environment
+```
 
-- Run `python test.py` for testing.
+## Install
 
-- Set the model path (where the trained model saved) and the image path (where the image saved during testing) to your local path. 
+Requires Python ≥ 3.10. With `pip` (or `uv`):
 
-    `line45:  MODEL_PATH = '' ` 
+```bash
+pip install -e .
+```
 
-    `line49:  IMAGE_PATH = '' ` 
+Optional visualization extras (`torchviz`, `graphviz`):
+
+```bash
+pip install -e ".[viz]"
+```
+
+Or with Conda using the bundled environment file:
+
+```bash
+conda env create -f environment.yml
+conda activate hinet
+```
 
 ## Dataset
-- In this paper, we use the commonly used dataset DIV2K, COCO, and ImageNet.
 
-- For train or test on your own dataset, change the code in `config.py`:
+The default training/validation paths in `main.py` are
+`datasets/DIV2K_train_HR/` and `datasets/DIV2K_valid_HR/`. A helper script is
+included to fetch DIV2K:
 
-    `line30:  TRAIN_PATH = '' ` 
+```bash
+bash scripts/download_div2k.sh
+```
 
-    `line31:  VAL_PATH = '' `
+You can override the paths via `--train_dir` and `--val_dir`.
 
+## Training
 
-## Trained Model
-- Here we provide a trained [model](https://drive.google.com/drive/folders/1l3XBFYPMaNFdvCWyOHfB2qIPkpjIxZgE?usp=sharing).
+The training is split into two stages: a long clean-training warmup, followed
+by a noise-robust fine-tuning phase that resumes from the stage-1 checkpoint.
 
-- Fill in the `MODEL_PATH` and the file name `suffix` before testing by the trained model.
+### Stage 1 — clean training (no noise layer), 2000 epochs
 
-- For example, if the model name is `model.pt` and its path is `/home/usrname/Hinet/model/`, 
-set `MODEL_PATH = '/home/usrname/Hinet/model/'` and file name `suffix = 'model.pt'`.
+```bash
+python3 main.py --epochs 2000 --batch_size 16 \
+    --checkpoint_every 10 --val_freq 10 --lr 3.16e-5
+```
 
+This trains HiNet at the original paper learning rate
+(`10^-4.5 ≈ 3.16e-5`), saves a checkpoint every 10 epochs to
+`checkpoints/hinet_epoch_*.pth`, validates every 10 epochs, and tracks the best
+PSNR(secret) checkpoint as `checkpoints/hinet_best.pth`. A per-epoch row is
+appended to `results/training_log.csv` and a sample grid is written to
+`results/epoch_<N>.png` on every validation step.
 
-## Training Demo (2021/12/25 Updated)
-- Here we provide a training demo to show how to train a converged model in the early training stage. During this process, the model may suffer from explosion. Our solution is to stop the training process at a normal node and abate the learning rate. Then, continue to train the model.
+### Stage 2 — noise-robust fine-tuning, resume from stage 1
 
-- Note that in order to log the training process, we have imported `logging` package, with slightly modified `train_logging.py` and `util.py` files.
+```bash
+python3 main.py --epochs 1000 --batch_size 16 \
+    --checkpoint_every 10 --val_freq 10 \
+    --resume model/hinet_trained_till_2000.pth \
+    --lr 2e-6 --start_epoch 0 \
+    --noise --jpeg_quality_min 50 --jpeg_quality_max 95
+```
 
+This fine-tunes the stage-1 checkpoint for another 1000 epochs at a lower
+learning rate (`2e-6`) with the differentiable noise layer enabled, sampling
+JPEG quality uniformly in `[50, 95]` per step. Adjust `--resume` to point at
+your stage-1 output.
 
-- Stage1: 
-  Run `python train_logging.py` for training with initial `config.py` (learning rate=10^-4.5).
-  
-  The logging file is [train__211222-183515.log](https://github.com/TomTomTommi/HiNet/blob/main/logging/train__211222-183515.log).
-  (The values of r_loss and g_loss are reversed due to a small bug, which has been debuged in stage2.)
-  <br/>
-  <br/>
-  See the tensorboard:
-  <br/>
-  <img src=https://github.com/TomTomTommi/HiNet/blob/main/logging/stage1.png width=60% />
-  <br/>
-  <br/>
-  Note that in the 507-th epoch the model exploded. Thus, we stop the stage1 at epoch 500.
+### Diagnostic flags
 
+- `--sanity` — run a Karpathy-style sanity check (saves `results/sanity_inputs.png`,
+  prints initial losses) and exits.
+- `--overfit_one_batch` — overfit a single batch for 500 steps to verify model
+  capacity, and exits.
+- `--no_grad_safety` — disable gradient clipping and the watchdog (exact paper
+  reproduction). The default `--max_grad_norm 10.0` and watchdog factor `5.0`
+  protect against the loss explosions described in the original training demo.
 
-- Stage2: 
-  Set `suffix = 'model_checkpoint_00500.pt'` and `tain_next = True` and `trained_epoch = 500`.
-  
-  Change the learning rate from 10^-4.5 to 10^-5.0.
-  
-  Run `python train_logging.py` for training.
-  <br/>
-  The logging file is [train__211223-100502.log](https://github.com/TomTomTommi/HiNet/blob/main/logging/train__211223-100502.log).
-  <br/>
-  <br/>
-  See the tensorboard:
-  <br/>
-  <img src=https://github.com/TomTomTommi/HiNet/blob/main/logging/stage2.png width=60% />
-  <br/>
-  <br/>
-  Note that in the 1692-th epoch the model exploded. Thus, we stop the stage2 at epoch 1690.
+## Evaluation
 
+After training, run the attack-robustness suite:
 
-- Stage3: 
-  Similar operation.
-  
-  Change the learning rate from 10^-5.0 to 10^-5.2.
-  
-  The logging file is [train__211224-105010.log](https://github.com/TomTomTommi/HiNet/blob/main/logging/train__211224-105010.log).
-  <br/>
-  <br/>
-  See the tensorboard:
-  <br/>
-  <img src=https://github.com/TomTomTommi/HiNet/blob/main/logging/stage3.png width=60% />
-  <br/>
-  <br/>
-  We can see that the network has initially converged. Then, you can change the super-parameters lamda according to the PSNR to balance the quality between stego image and recovered image. Note that the PSNR in the tensorboard is RGB-PSNR and in our paper is Y-PSNR.
+```bash
+python evaluate.py --checkpoint checkpoints/hinet_best.pth
+```
 
+This evaluates the model under the following attacks (defined in
+`evaluate.py::ATTACKS`) and writes PSNR / SSIM per attack to
+`results/evaluation/report.txt`, plus a side-by-side sample strip per attack:
 
-## Others
-- The `batchsize_val` in `config.py` should be at least `2*number of gpus` and it should be divisible by number of gpus.
+- `clean` — no attack
+- `jpeg_90`, `jpeg_50` — real PIL JPEG compression
+- `blur` — Gaussian blur (radius 2)
+- `noise` — additive Gaussian noise (σ = 0.03)
+- `resize_50`, `resize_75` — bilinear down/upscale
+- `social` — combined resize 0.75 + JPEG 70 (social-media-like pipeline)
+
+Each attack is graded `PASS` (>28 dB), `WARN` (>20 dB), or `FAIL`.
+
+## Legacy reference code
+
+The original ICCV-2021 reference implementation (`train.py`, `test.py`,
+`config.py`, `hinet.py`, `model.py`, etc.) has been moved into
+[`legacy/`](legacy/) for reference. See [`legacy/README.md`](legacy/README.md)
+for usage notes.
 
 ## Citation
-If you find our paper or code useful for your research, please cite:
+
 ```
 @InProceedings{Jing_2021_ICCV,
     author    = {Jing, Junpeng and Deng, Xin and Xu, Mai and Wang, Jianyi and Guan, Zhenyu},
@@ -116,5 +151,4 @@ If you find our paper or code useful for your research, please cite:
     year      = {2021},
     pages     = {4733-4742}
 }
-
 ```
