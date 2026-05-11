@@ -14,6 +14,16 @@ script. The unmodified reference implementation is preserved under
   <img src="HiNet.png" width="60%" />
 </center>
 
+The Phase 3 variant in this repository extends HiNet with a differentiable
+noise layer inserted between the hide and reveal stacks, so gradients flow
+through channel distortions (JPEG, blur, additive noise, dropout, resize, and
+a combined social-media pipeline) and the network learns noise-resilient
+codes:
+
+<center>
+  <img src="docs/images/phase3_architecture.png" width="90%" />
+</center>
+
 ## Project layout
 
 ```
