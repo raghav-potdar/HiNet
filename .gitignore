@@ -53,5 +53,3 @@ model/*.pt
 model/*.pth
 model/*.ckpt
 checkpoints/*
-
-*.pdf

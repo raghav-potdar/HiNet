@@ -10,6 +10,14 @@ a multi-stage training driver and a post-training attack-robustness evaluation
 script. The unmodified reference implementation is preserved under
 [`legacy/`](legacy/) for comparison.
 
+- **Project report:** [`docs/report.pdf`](docs/report.pdf) — full write-up of
+  the Nexus-Steg pipeline, training stages, and evaluation results.
+- **Live demo:** [nexus-hinet-app.streamlit.app](https://nexus-hinet-app.streamlit.app/)
+  — hosted Streamlit app that loads a trained checkpoint and lets you
+  hide/reveal images interactively in the browser.
+- **Demo source:** [Nexus-Hinet-Streamlit](https://github.com/hariharan-sabapathi/Nexus-Hinet-Streamlit)
+  — codebase for the Streamlit app above.
+
 <center>
   <img src="HiNet.png" width="60%" />
 </center>
